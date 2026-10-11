@@ -26,10 +26,10 @@ public class MainForm : Form
     private const int BoostMaxFreqMHz = 3500;    // 트레이 메뉴 "부스트 켜기" 시 최고 속도 (앱 실행 중에만)
 
     private readonly Computer _computer = new() { IsCpuEnabled = true };
-    private readonly Label _packageTemp = new() { AutoSize = true, Font = new Font("Segoe UI", 22, FontStyle.Bold), ForeColor = Color.White };
-    private readonly Label _powerInfo = new() { AutoSize = true, Font = new Font("Segoe UI", 10, FontStyle.Bold), ForeColor = Color.White };
+    private readonly OutlinedLabel _packageTemp = new() { AutoSize = true, Font = new Font("Segoe UI", 22, FontStyle.Bold), ForeColor = Color.White };
+    private readonly OutlinedLabel _powerInfo = new() { AutoSize = true, Font = new Font("Segoe UI", 10, FontStyle.Bold), ForeColor = Color.White };
     private readonly ManagementObjectSearcher _batterySearcher = new(@"root\wmi", "SELECT PowerOnline, Charging, ChargeRate, DischargeRate FROM BatteryStatus");
-    private readonly Label _limitInfo = new() { AutoSize = true, Font = new Font("Segoe UI", 9, FontStyle.Bold), ForeColor = Color.Orange, Visible = false };
+    private readonly OutlinedLabel _limitInfo = new() { AutoSize = true, Font = new Font("Segoe UI", 9, FontStyle.Bold), ForeColor = Color.Orange, Visible = false };
     private readonly System.Windows.Forms.Timer _timer = new() { Interval = 1000 };
     private readonly NotifyIcon _tray = new() { Text = "CPU 온도", Visible = true };
     private string? _trayText;
@@ -38,6 +38,11 @@ public class MainForm : Form
     private bool _boost;
     private bool _emergency;
     private int _capMHz = DefaultMaxFreqMHz; // 지금 걸려 있는 최고 속도 (온도 때문에 TopFreqMHz보다 낮아질 수 있음)
+    private bool _moveMode;                  // 트레이 메뉴 "위치 이동" 중: 클릭 통과를 끄고 끌어서 옮길 수 있음
+    private Point? _savedLocation = LoadPosition(); // 사용자가 옮긴 위치. 없으면 오른쪽 위
+
+    // 옮긴 위치는 재부팅해도 유지되도록 파일에 저장
+    private static readonly string PositionPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "CpuT", "position.txt");
 
     private int TopFreqMHz => _boost ? BoostMaxFreqMHz : DefaultMaxFreqMHz;
 
@@ -58,6 +63,9 @@ public class MainForm : Form
         var boostItem = new ToolStripMenuItem("부스트 켜기") { CheckOnClick = true };
         boostItem.CheckedChanged += (_, _) => SetBoost(boostItem.Checked);
         menu.Items.Add(boostItem);
+        var moveItem = new ToolStripMenuItem("위치 이동") { CheckOnClick = true };
+        moveItem.CheckedChanged += (_, _) => SetMoveMode(moveItem.Checked);
+        menu.Items.Add(moveItem);
         menu.Items.Add("종료", null, (_, _) => Close());
         _tray.ContextMenuStrip = menu;
         UpdateTrayIcon("--", Color.Gray);
@@ -67,6 +75,8 @@ public class MainForm : Form
         layout.Controls.Add(_powerInfo);
         layout.Controls.Add(_limitInfo);
         Controls.Add(layout);
+        foreach (Control c in new Control[] { this, layout, _packageTemp, _powerInfo, _limitInfo })
+            c.MouseDown += StartDrag;
 
         if (!PawnIo.IsInstalled)
         {
@@ -83,23 +93,75 @@ public class MainForm : Form
         UpdateTemperatures();
     }
 
-    // WS_EX_LAYERED | WS_EX_TRANSPARENT: 마우스 클릭이 이 창을 통과해 뒤 창으로 간다.
+    private const int GWL_EXSTYLE = -20;
+    private const int WS_EX_LAYERED = 0x80000;
+    private const int WS_EX_TRANSPARENT = 0x20;   // 마우스 클릭이 이 창을 통과해 뒤 창으로 간다
+    private const int WM_NCLBUTTONDOWN = 0xA1;
+    private const int HTCAPTION = 2;
+
+    [DllImport("user32.dll")]
+    private static extern int GetWindowLong(IntPtr hWnd, int nIndex);
+    [DllImport("user32.dll")]
+    private static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
+    [DllImport("user32.dll")]
+    private static extern bool ReleaseCapture();
+    [DllImport("user32.dll")]
+    private static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+
     protected override CreateParams CreateParams
     {
         get
         {
             var cp = base.CreateParams;
-            cp.ExStyle |= 0x80000 | 0x20;
+            cp.ExStyle |= WS_EX_LAYERED;
+            if (!_moveMode)
+                cp.ExStyle |= WS_EX_TRANSPARENT;
             return cp;
         }
     }
 
-    // 크기가 바뀔 때마다(글자 길이 변화 등) 오른쪽 위에 다시 붙인다.
+    // 위치 이동 중에는 배경을 회색으로 보이게 하고 클릭 통과를 꺼서 끌 수 있게 한다
+    private void SetMoveMode(bool on)
+    {
+        _moveMode = on;
+        BackColor = on ? Color.FromArgb(70, 70, 70) : Color.Black;
+        Cursor = on ? Cursors.SizeAll : Cursors.Default;
+        int ex = GetWindowLong(Handle, GWL_EXSTYLE);
+        SetWindowLong(Handle, GWL_EXSTYLE, on ? ex & ~WS_EX_TRANSPARENT : ex | WS_EX_TRANSPARENT);
+    }
+
+    // 테두리 없는 창을 제목 표시줄처럼 끌게 하는 방법. SendMessage는 끌기가 끝나야 돌아온다.
+    private void StartDrag(object? sender, MouseEventArgs e)
+    {
+        if (!_moveMode || e.Button != MouseButtons.Left)
+            return;
+        ReleaseCapture();
+        SendMessage(Handle, WM_NCLBUTTONDOWN, HTCAPTION, IntPtr.Zero);
+        _savedLocation = Location;
+        Directory.CreateDirectory(Path.GetDirectoryName(PositionPath)!);
+        File.WriteAllText(PositionPath, $"{Location.X},{Location.Y}");
+    }
+
+    private static Point? LoadPosition()
+    {
+        if (!File.Exists(PositionPath))
+            return null;
+        var parts = File.ReadAllText(PositionPath).Split(',');
+        return parts.Length == 2 && int.TryParse(parts[0], out int x) && int.TryParse(parts[1], out int y) ? new Point(x, y) : null;
+    }
+
+    // 크기가 바뀔 때마다(글자 길이 변화 등) 저장된 위치(없으면 오른쪽 위)에 다시 놓되, 화면 밖으로 나가지 않게 한다.
     protected override void OnSizeChanged(EventArgs e)
     {
         base.OnSizeChanged(e);
-        var area = Screen.PrimaryScreen!.WorkingArea;
-        Location = new Point(area.Right - Width - ScreenMargin, area.Top + ScreenMargin);
+        if (_savedLocation is not Point p)
+        {
+            var area = Screen.PrimaryScreen!.WorkingArea;
+            Location = new Point(area.Right - Width - ScreenMargin, area.Top + ScreenMargin);
+            return;
+        }
+        var wa = Screen.FromPoint(p).WorkingArea;
+        Location = new Point(Math.Clamp(p.X, wa.Left, wa.Right - Width), Math.Clamp(p.Y, wa.Top, wa.Bottom - Height));
     }
 
     private void UpdateTemperatures()
