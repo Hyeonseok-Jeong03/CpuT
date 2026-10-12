@@ -22,8 +22,10 @@ public class MainForm : Form
 
     private const int BatteryIntervalSec = 3; // 배터리 정보는 조회 비용이 커서 몇 초에 한 번만 읽음
     private const int MaxLimit = 100;            // 평소 최대 프로세서 상태 (100 미만이면 부스트가 꺼짐)
-    private const int DefaultMaxFreqMHz = 3000;  // 평소 최고 속도 → 4.9GHz 순간 부스트로 온도가 튀는 것 방지
-    private const int BoostMaxFreqMHz = 3500;    // 트레이 메뉴 "부스트 켜기" 시 최고 속도 (앱 실행 중에만)
+    // 트레이 메뉴에서 고르는 모드별 최고 속도. 앱을 켜면 항상 "기본"으로 시작
+    private const int EcoMaxFreqMHz = 2000;      // 절전: 가벼운 작업·유휴 때 온도를 더 낮춤
+    private const int DefaultMaxFreqMHz = 3000;  // 기본: 4.9GHz 순간 부스트로 온도가 튀는 것 방지
+    private const int BoostMaxFreqMHz = 3500;    // 부스트 (앱 실행 중에만)
 
     private readonly Computer _computer = new() { IsCpuEnabled = true };
     private readonly OutlinedLabel _packageTemp = new() { AutoSize = true, Font = new Font("Segoe UI", 22, FontStyle.Bold), ForeColor = Color.White };
@@ -35,7 +37,7 @@ public class MainForm : Form
     private string? _trayText;
     private string _batteryText = "";
     private int _tick;
-    private bool _boost;
+    private int _modeMHz = DefaultMaxFreqMHz; // 선택한 모드의 최고 속도
     private bool _emergency;
     private int _capMHz = DefaultMaxFreqMHz; // 지금 걸려 있는 최고 속도 (온도 때문에 TopFreqMHz보다 낮아질 수 있음)
     private bool _moveMode;                  // 트레이 메뉴 "위치 이동" 중: 클릭 통과를 끄고 끌어서 옮길 수 있음
@@ -44,7 +46,7 @@ public class MainForm : Form
     // 옮긴 위치는 재부팅해도 유지되도록 파일에 저장
     private static readonly string PositionPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "CpuT", "position.txt");
 
-    private int TopFreqMHz => _boost ? BoostMaxFreqMHz : DefaultMaxFreqMHz;
+    private int TopFreqMHz => _modeMHz;
 
     public MainForm()
     {
@@ -60,9 +62,24 @@ public class MainForm : Form
         Padding = new Padding(8);
 
         var menu = new ContextMenuStrip();
-        var boostItem = new ToolStripMenuItem("부스트 켜기") { CheckOnClick = true };
-        boostItem.CheckedChanged += (_, _) => SetBoost(boostItem.Checked);
-        menu.Items.Add(boostItem);
+        // 모드 3개 중 하나만 체크되는 메뉴
+        var modeItems = new[]
+        {
+            new ToolStripMenuItem($"절전 (최대 {EcoMaxFreqMHz / 1000.0:0.0}GHz)") { Tag = EcoMaxFreqMHz },
+            new ToolStripMenuItem($"기본 (최대 {DefaultMaxFreqMHz / 1000.0:0.0}GHz)") { Tag = DefaultMaxFreqMHz, Checked = true },
+            new ToolStripMenuItem($"부스트 (최대 {BoostMaxFreqMHz / 1000.0:0.0}GHz)") { Tag = BoostMaxFreqMHz },
+        };
+        foreach (var item in modeItems)
+        {
+            item.Click += (_, _) =>
+            {
+                foreach (var other in modeItems)
+                    other.Checked = other == item;
+                SetMode((int)item.Tag!);
+            };
+            menu.Items.Add(item);
+        }
+        menu.Items.Add(new ToolStripSeparator());
         var moveItem = new ToolStripMenuItem("위치 이동") { CheckOnClick = true };
         moveItem.CheckedChanged += (_, _) => SetMoveMode(moveItem.Checked);
         menu.Items.Add(moveItem);
@@ -296,11 +313,11 @@ public class MainForm : Form
             UpdateLimitInfo();
     }
 
-    // 트레이 메뉴 "부스트 켜기": 최고 속도 상한만 바꾼다. 온도 때문에 제한 중이면 그 제한은 유지하고, 풀릴 때 새 상한까지 올라간다.
-    private void SetBoost(bool on)
+    // 트레이 메뉴 모드 선택: 최고 속도 상한만 바꾼다. 온도 때문에 제한 중이면 그 제한은 유지하고, 풀릴 때 새 상한까지 올라간다.
+    private void SetMode(int modeMHz)
     {
         bool throttled = _capMHz < TopFreqMHz;
-        _boost = on;
+        _modeMHz = modeMHz;
         if (!throttled || _capMHz > TopFreqMHz)
         {
             _capMHz = TopFreqMHz;
@@ -313,7 +330,8 @@ public class MainForm : Form
     {
         _limitInfo.Text = _emergency ? "과열! CPU 속도 급감속 중"
                         : _capMHz < TopFreqMHz ? $"CPU 속도 제한 {_capMHz / 1000.0:0.0}GHz"
-                        : _boost ? $"부스트 켜짐 (최대 {BoostMaxFreqMHz / 1000.0:0.0}GHz)"
+                        : _modeMHz == BoostMaxFreqMHz ? $"부스트 켜짐 (최대 {BoostMaxFreqMHz / 1000.0:0.0}GHz)"
+                        : _modeMHz == EcoMaxFreqMHz ? $"절전 모드 (최대 {EcoMaxFreqMHz / 1000.0:0.0}GHz)"
                         : "";
         _limitInfo.Visible = _limitInfo.Text != "";
     }
@@ -344,7 +362,7 @@ public class MainForm : Form
     {
         _timer.Stop();
         if (_capMHz != DefaultMaxFreqMHz)
-            SetMaxFrequency(DefaultMaxFreqMHz); // 앱을 끄면 부스트·온도 제한은 풀고 기본 속도로 (쿨러 고장 대비)
+            SetMaxFrequency(DefaultMaxFreqMHz); // 앱을 끄면 모드·온도 제한은 풀고 기본 속도로 (쿨러 고장 대비)
         if (_emergency)
             SetMaxProcessorState(MaxLimit);
         _computer.Close();
