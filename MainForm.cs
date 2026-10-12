@@ -45,6 +45,8 @@ public class MainForm : Form
 
     // 옮긴 위치는 재부팅해도 유지되도록 파일에 저장
     private static readonly string PositionPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "CpuT", "position.txt");
+    private bool _overlayVisible;            // 사용자가 메뉴에서 고른 표시 여부. 앱을 켜면 항상 숨긴 상태로 시작 (온도 감시·보호는 계속 동작)
+    private bool _hotAlert;                  // 85°C 이상이라 숨겨 둔 오버레이를 잠시 띄운 상태 (80°C 이하로 식으면 해제)
 
     private int TopFreqMHz => _modeMHz;
 
@@ -80,6 +82,9 @@ public class MainForm : Form
             menu.Items.Add(item);
         }
         menu.Items.Add(new ToolStripSeparator());
+        var overlayItem = new ToolStripMenuItem("오버레이 표시") { CheckOnClick = true, Checked = _overlayVisible };
+        overlayItem.CheckedChanged += (_, _) => SetOverlayVisible(overlayItem.Checked);
+        menu.Items.Add(overlayItem);
         var moveItem = new ToolStripMenuItem("위치 이동") { CheckOnClick = true };
         moveItem.CheckedChanged += (_, _) => SetMoveMode(moveItem.Checked);
         menu.Items.Add(moveItem);
@@ -94,6 +99,7 @@ public class MainForm : Form
         Controls.Add(layout);
         foreach (Control c in new Control[] { this, layout, _packageTemp, _powerInfo, _limitInfo })
             c.MouseDown += StartDrag;
+        _ = Handle; // 오버레이를 숨긴 채 시작해도 창이 만들어져 있어야 종료(Close)·정리가 정상 동작함
 
         if (!PawnIo.IsInstalled)
         {
@@ -135,6 +141,15 @@ public class MainForm : Form
                 cp.ExStyle |= WS_EX_TRANSPARENT;
             return cp;
         }
+    }
+
+    // 오버레이를 숨겨도 앱(온도 감시·과열 보호·트레이 아이콘)은 계속 동작한다
+    protected override void SetVisibleCore(bool value) => base.SetVisibleCore(value && (_overlayVisible || _hotAlert));
+
+    private void SetOverlayVisible(bool on)
+    {
+        _overlayVisible = on;
+        Visible = on || _hotAlert;
     }
 
     // 위치 이동 중에는 배경을 회색으로 보이게 하고 클릭 통과를 꺼서 끌 수 있게 한다
@@ -206,7 +221,17 @@ public class MainForm : Form
         UpdateTrayIcon(package == null ? "--" : $"{package.Value:0}", package == null ? Color.Gray : TempColor(package.Value));
 
         if (package?.Value is float temp)
+        {
             AdjustLimit(temp, MaxCoreClockMHz(cpu));
+
+            // 오버레이를 숨겨 뒀어도 85°C 이상이면 자동으로 띄우고, 80°C 이하로 식으면 다시 숨긴다
+            bool hot = temp >= LimitStartTemp || (_hotAlert && temp > LimitReleaseTemp);
+            if (hot != _hotAlert)
+            {
+                _hotAlert = hot;
+                Visible = _overlayVisible || _hotAlert;
+            }
+        }
     }
 
     // 가장 빠른 코어의 현재 속도(MHz). Bus Speed는 코어 속도가 아니라 제외
